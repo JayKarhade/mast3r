@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+checkpoints/
+outputs/
+tmp/
+asmk/
 
 # C extensions
 *.so
