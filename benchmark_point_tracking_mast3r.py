@@ -11,10 +11,6 @@ from natsort import natsorted
 import json
 import copy
 
-# Import CoTrackerv3
-
-from cotracker.predictor import CoTrackerPredictor
-
 # Import Mast3r
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from mast3r.cloud_opt.tsdf_optimizer import TSDFPostProcess
@@ -22,18 +18,21 @@ from mast3r.image_pairs import make_pairs
 from mast3r.model import AsymmetricMASt3R
 from dust3r.inference import inference
 from dust3r.utils.image import load_images, rgb
-from dust3r.utils.device import to_numpy
+from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
+
+from anymap.models.vggt.utils.rotation import mat_to_quat
+from anymap.utils.geometry import (
+    convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap,
+    convert_z_depth_to_depth_along_ray,
+    depthmap_to_camera_frame,
+    get_rays_in_camera_frame,
+)
 
 try:
     from mast3r.retrieval.processor import Retriever
     has_retrieval = True
 except Exception:
     has_retrieval = False
-
-import mast3r.utils.path_to_dust3r  # noqa
-from dust3r.utils.image import load_images
-from dust3r.utils.device import to_numpy
-from dust3r.viz import add_scene_cam, CAM_COLORS, OPENGL, pts3d_to_trimesh, cat_meshes
 
 # Import dataset modules
 from anymap.datasets.multi_view_motion.tapvid3d_pstudio import TAPVID3D_PStudio_MultiView_Motion
@@ -336,13 +335,73 @@ def normalize_multiple_pointclouds(pts_list, valid_masks):
 #                                    matching_conf_thr=matching_conf_thr)
     
 #     # Get parameters
-#     intrinsics = scene.intrinsics.detach().cpu().numpy()
-#     cams2world = scene.get_im_poses().detach().cpu().numpy()
-#     pts3d = scene.get_sparse_pts3d()
-#     import pdb; pdb.set_trace()
-#     pts3d = torch.stack(pts3d).detach().cpu().numpy()
+#     # intrinsics = scene.intrinsics.detach().cpu().numpy()
+#     # cams2world = scene.get_im_poses().detach().cpu().numpy()
+#     # pts3d, _, _ = scene.get_dense_pts3d() #list of (H*W,3)
+#     # pts3d = torch.stack(pts3d, dim=0) # [len(list), H*W, 3]
 
-#     return intrinsics, cams2world, pts3d
+#     # _, _, H, W = imgs[0]['img'].shape
+#     # # Reshape to [50,H,W,3]
+#     # pts3d = pts3d.view(len(imgs), H, W, 3).detach().cpu().numpy()
+
+#     # Get the predictions
+#     intrinsics = scene.intrinsics
+#     c2w_poses = scene.get_im_poses()
+#     _, depths, _ = scene.get_dense_pts3d()
+
+#     # Get the height and width from the first image
+#     height, width = imgs[0]['img'].shape[2:]
+
+#     pts3d = []
+#     with torch.autocast("cuda", enabled=False):
+#         res = []
+#         for view_idx in range(len(imgs)):
+#             # Get the current view predictions
+#             curr_view_intrinsic = intrinsics[view_idx].unsqueeze(0)
+#             curr_view_pose = c2w_poses[view_idx].unsqueeze(0)
+#             curr_view_depth_z = (
+#                 depths[view_idx].reshape((height, width)).unsqueeze(0)
+#             )
+
+#             # Convert the pose to quaternions and translation
+#             curr_view_cam_translations = curr_view_pose[..., :3, 3]
+#             curr_view_cam_quats = mat_to_quat(curr_view_pose[..., :3, :3])
+
+#             # Get the camera frame pointmaps
+#             curr_view_pts3d_cam, _ = depthmap_to_camera_frame(
+#                 curr_view_depth_z, curr_view_intrinsic
+#             )
+
+#             # Convert the z depth to depth along ray
+#             curr_view_depth_along_ray = convert_z_depth_to_depth_along_ray(
+#                 curr_view_depth_z, curr_view_intrinsic
+#             )
+#             curr_view_depth_along_ray = curr_view_depth_along_ray.unsqueeze(-1)
+
+#             # Get the ray directions on the unit sphere in the camera frame
+#             _, curr_view_ray_dirs = get_rays_in_camera_frame(
+#                 curr_view_intrinsic, height, width, normalize_to_unit_sphere=True
+#             )
+
+#             # Get the pointmaps
+#             curr_view_pts3d = (
+#                 convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
+#                     curr_view_ray_dirs,
+#                     curr_view_depth_along_ray,
+#                     curr_view_cam_translations,
+#                     curr_view_cam_quats,
+#                 )
+#             )
+
+#             pts3d.append(curr_view_pts3d.squeeze(0))
+
+#     pts3d = torch.stack(pts3d, dim=0)  # [len(imgs), H, W, 3]
+
+#     intrinsics = intrinsics.detach().cpu().numpy()
+#     c2w_poses = c2w_poses.detach().cpu().numpy()
+#     pts3d = pts3d.detach().cpu().numpy()
+
+#     return intrinsics, c2w_poses, pts3d
 
 def get_mast3r_reconstruction(image_paths, model, device='cuda', image_size=512,
                            schedule='linear', niter=300, min_conf_thr=3.0,
@@ -436,6 +495,36 @@ def mast3r_cotracker(args, collected_image_paths, collected_images, collected_qu
         scenegraph_type=args.scenegraph_type
     )
 
+    # # Load retrieval model if specified
+    # retrieval_model = None
+    # if args.retrieval_model:
+    #     if not has_retrieval:
+    #         raise ValueError("Retrieval functionality not available")
+    #     print(f"Loading retrieval model {args.retrieval_model}")
+    #     # Load retrieval model here based on your specific implementation
+    #     retrieval_model = args.retrieval_model
+
+    # pred_intrinsics, pred_cams2world, pointmaps = get_mast3r_reconstruction(
+    #     collected_image_paths,
+    #     model=mast3r_model,
+    #     device=args.device,
+    #     image_size=args.image_size,
+    #     retrieval_model=retrieval_model,
+    #     optim_level=args.optim_level,
+    #     lr1=args.lr1,
+    #     niter1=args.niter1,
+    #     lr2=args.lr2,
+    #     niter2=args.niter2,
+    #     min_conf_thr=args.min_conf_thr,
+    #     matching_conf_thr=args.matching_conf_thr,
+    #     scenegraph_type=args.scenegraph_type,
+    #     winsize=args.winsize,
+    #     win_cyclic=args.win_cyclic,
+    #     refid=args.refid,
+    #     TSDF_thresh=args.TSDF_thresh,
+    #     shared_intrinsics=args.shared_intrinsics
+    # )
+
     # Use pred_tracks from cotracker to get 3D tracks
     pred_tracks = pred_tracks.squeeze(0)  # (T, N, 2)
     T, N, _ = pred_tracks.shape
@@ -499,6 +588,58 @@ def get_args_parser():
                        choices=['complete', 'swin', 'oneref'],
                        help='Scene graph type')
 
+
+    # parser.add_argument('--model_name', type=str, 
+    #                    default="MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric",
+    #                    help='Model name (alternative to weights)')
+    # parser.add_argument('--retrieval_model', type=str, default='checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth',
+    #                    help='Path to retrieval model')
+    # parser.add_argument('--device', type=str, default='cuda',
+    #                    help='Device to use (cuda/cpu)')
+    # parser.add_argument('--image_size', type=int, default=512,
+    #                    help='Image size for processing')
+    
+    # # Optimization parameters
+    # parser.add_argument('--optim_level', type=str, default='refine+depth',
+    #                    choices=['coarse', 'refine', 'refine+depth'],
+    #                    help='Optimization level')
+    # parser.add_argument('--lr1', type=float, default=0.07,
+    #                    help='Learning rate for coarse alignment')
+    # parser.add_argument('--niter1', type=int, default=300,
+    #                    help='Number of iterations for coarse alignment')
+    # parser.add_argument('--lr2', type=float, default=0.01,
+    #                    help='Learning rate for refinement')
+    # parser.add_argument('--niter2', type=int, default=300,
+    #                    help='Number of iterations for refinement')
+    
+    # # Scene graph parameters
+    # parser.add_argument('--scenegraph_type', type=str, default='oneref',
+    #                    choices=['complete', 'swin', 'logwin', 'oneref', 'retrieval'],
+    #                    help='Scene graph type')
+    # parser.add_argument('--winsize', type=int, default=1,
+    #                    help='Window size for scene graph')
+    # parser.add_argument('--win_cyclic', action='store_true',
+    #                    help='Use cyclic sequence for scene graph')
+    # parser.add_argument('--refid', type=int, default=0,
+    #                    help='Reference ID for scene graph')
+    
+    # # Post-processing parameters
+    # parser.add_argument('--min_conf_thr', type=float, default=1.5,
+    #                    help='Minimum confidence threshold')
+    # parser.add_argument('--matching_conf_thr', type=float, default=0.0,
+    #                    help='Matching confidence threshold')
+    # parser.add_argument('--TSDF_thresh', type=float, default=0.0,
+    #                    help='TSDF threshold for post-processing')
+    # parser.add_argument('--as_pointcloud', action='store_true', default=True,
+    #                    help='Export as pointcloud instead of mesh')
+    # parser.add_argument('--mask_sky', action='store_true',
+    #                    help='Apply sky masking')
+    # parser.add_argument('--clean_depth', action='store_true', default=True,
+    #                    help='Clean up depth maps')
+    # parser.add_argument('--shared_intrinsics', action='store_true',
+    #                    help='Use shared intrinsics for all views')
+
+
     # Add rerun visualization arguments
     script_add_rerun_args(parser)
     
@@ -530,28 +671,38 @@ def main():
     all_seq_metrics = {
         'epe3d_allo_image_all': 0.0,  # Sum of per-image average EPE3D in allo-centric
         'epe3d_allo_pixel_all': 0.0,  # Sum of all pixel EPE3D values in allo-centric
+        'epe3d_sf_allo_image_all': 0.0,  # Sum of per-image average EPE3D in allo-centric for scene flow
+        'epe3d_sf_allo_pixel_all': 0.0,  # Sum of all pixel EPE3D values in allo-centric for scene flow
         'num_valid_pixels': 0.0,     # Count of valid pixels
-        'delta_0.1': 0.0,            # Count of pixels with EPE3D < 0.1
-        'delta_0.3': 0.0,            # Count of pixels with EPE3D < 0.3
-        'delta_0.5': 0.0,            # Count of pixels with EPE3D < 0.5
-        'outlier_0.25': 0.0          # Count of outliers with EPE3D > 0.25
+        'delta_0.05': 0.0,            # Count of pixels with abs_rel < 0.05
+        'delta_0.1': 0.0,            # Count of pixels with abs_rel < 0.1
+        'delta_0.2': 0.0,            # Count of pixels with abs_rel < 0.2
+        'delta_0.4': 0.0,            # Count of pixels with abs_rel < 0.4
+        'outlier_0.15': 0.0,          # Count of outliers with abs_rel > 0.15
+        'delta_epe_0.1': 0.0,        # Count of pixels with EPE3D < 0.1
+        'delta_epe_0.3': 0.0,         # Count of pixels with EPE3D < 0.3
+        'delta_epe_0.5': 0.0,         # Count of pixels with EPE3D < 0.5
+        'delta_epe_1.0': 0.0,         # Count of pixels with EPE3D < 1.0
+        'outlier_epe_0.25': 0.0,         # Count of outliers with EPE3D > 0.25
     }
 
     # Set thresholds for accuracy metrics
-    delta_thresholds = [0.1, 0.3, 0.5]
-    outlier_thresholds = [0.25]
+    delta_thresholds = [0.05, 0.1, 0.2, 0.4]
+    delta_epe_thresholds = [0.1, 0.3, 0.5, 1.0]
+    outlier_thresholds = [0.15]
+    outlier_epe_thresholds = [0.25]
 
     # Dataset initialization
     if args.dataset == "tapvid3d_pstudio":
-        data_sequences = natsorted(glob.glob(f"{args.dataset_dir}/*.npz"))[:5]
+        data_sequences = natsorted(glob.glob(f"{args.dataset_dir}/*.npz"))[:10]
     elif args.dataset == "tapvid3d_adt":
-        data_sequences = natsorted(glob.glob(f"{args.dataset_dir}/*multiuser*.npz"))[:5]
+        data_sequences = natsorted(glob.glob(f"{args.dataset_dir}/*multiuser*.npz"))[:10]
     elif args.dataset == "tapvid3d_drivetrack":
-        data_sequences = json.load(open('/ocean/projects/cis220039p/mdt2/jkarhade/Any4D/anymap/datasets/multi_view_motion/drive_track_eligible_scenes.json'))[:5]
+        data_sequences = json.load(open('/ocean/projects/cis220039p/mdt2/jkarhade/Any4D/anymap/datasets/multi_view_motion/drive_track_eligible_scenes.json'))[:10]
     elif args.dataset == "kubric_eval":
-        data_sequences = [str(i) for i in range(5700, 5700+50)][:5]
+        data_sequences = [str(i) for i in range(5700, 6000)][:10]
     elif args.dataset == "dynamic_replica_eval":
-        data_sequences = json.load(open('/ocean/projects/cis220039p/mdt2/jkarhade/Any4D/anymap/datasets/multi_view_motion/dynamic_replica_eval_val_scenes.json'))[:5]
+        data_sequences = json.load(open('/ocean/projects/cis220039p/mdt2/jkarhade/Any4D/anymap/datasets/multi_view_motion/dynamic_replica_eval_val_scenes.json'))[:10]
 
     print(f"Found {len(data_sequences)} sequences.")
 
@@ -585,11 +736,19 @@ def main():
         cur_seq_metrics = {
             'epe3d_allo_image_all': 0.0,  # Sum of per-image average EPE3D in allo-centric
             'epe3d_allo_pixel_all': 0.0,  # Sum of all pixel EPE3D values in allo-centric
+            'epe3d_sf_allo_image_all': 0.0,  # Sum of per-image average EPE3D in allo-centric for scene flow
+            'epe3d_sf_allo_pixel_all': 0.0,  # Sum of all pixel EPE3D values in allo-centric for scene flow
             'num_valid_pixels': 0.0,     # Count of valid pixels
-            'delta_0.1': 0.0,            # Count of pixels with EPE3D < 0.1
-            'delta_0.3': 0.0,            # Count of pixels with EPE3D < 0.3
-            'delta_0.5': 0.0,            # Count of pixels with EPE3D < 0.5
-            'outlier_0.25': 0.0          # Count of outliers with EPE3D > 0.25
+            'delta_0.05': 0.0,           # Count of pixels with abs_rel < 0.05
+            'delta_0.1': 0.0,            # Count of pixels with abs_rel < 0.1
+            'delta_0.2': 0.0,            # Count of pixels with abs_rel < 0.2
+            'delta_0.4': 0.0,            # Count of pixels with abs_rel < 0.4
+            'outlier_0.15': 0.0,         # Count of outliers with abs_rel > 0.15
+            'delta_epe_0.1': 0.0,        # Count of pixels with EPE3D < 0.1
+            'delta_epe_0.3': 0.0,         # Count of pixels with EPE3D < 0.3
+            'delta_epe_0.5': 0.0,         # Count of pixels with EPE3D < 0.5
+            'delta_epe_1.0': 0.0,         # Count of pixels with EPE3D < 1.0
+            'outlier_epe_0.25': 0.0,         # Count of outliers with EPE3D > 0.25
         }
 
         # Iterate over predictions to calculate metrics
@@ -621,26 +780,25 @@ def main():
                 gt_valid_mask0 = gt_valid_mask0 & (gt_allo_scene_flow[:, :, 2] != 0)
             
             # Normalize clouds, poses and scene flow
-            norm_gt_points, gt_norm_factor = normalize_multiple_pointclouds([gt_pts3d0, gt_pts3d1], [gt_valid_mask0, gt_valid_mask1])
-            # norm_gt_points = [gt_pts3d0 / gt_norm_factor, gt_pts3d1 / gt_norm_factor]
-            norm_gt_allo_scene_flow = gt_allo_scene_flow / gt_norm_factor
-            gt_cam0[:3, 3] /= gt_norm_factor
-            gt_cam1[:3, 3] /= gt_norm_factor
+            _, gt_norm_factor = normalize_multiple_pointclouds([gt_pts3d0, gt_pts3d1], [gt_valid_mask0, gt_valid_mask1])
+            _, pred_norm_factor = normalize_multiple_pointclouds([pred_tracks_3d_pts3d[0], pred_tracks_3d_pts3d[1]], [gt_valid_mask0, gt_valid_mask0])
 
-            norm_pred_points, pred_norm_factor = normalize_multiple_pointclouds([pred_pts3d[0], pred_pts3d[1]], [gt_valid_mask0, gt_valid_mask1])
-            # norm_pred_points = [pred_pts3d[0] / pred_norm_factor, pred_pts3d[1] / pred_norm_factor]
-            norm_pred_allo_scene_flow = pred_allo_scene_flow / pred_norm_factor
-            poses_c2w[0][:3, 3] /= pred_norm_factor
-            poses_c2w[1][:3, 3] /= pred_norm_factor
-
+            scaling_factor = gt_norm_factor / pred_norm_factor
+            pred_pts3d = [pts * scaling_factor for pts in pred_pts3d]
+            pred_tracks_3d_pts3d = [pts * scaling_factor for pts in pred_tracks_3d_pts3d]
+            pred_allo_scene_flow = pred_allo_scene_flow * scaling_factor
+            poses_c2w[0][:3, 3] = poses_c2w[0][:3, 3] * scaling_factor
+            poses_c2w[1][:3, 3] = poses_c2w[1][:3, 3] * scaling_factor
 
             # Calculate EPE3D
             # import pdb; pdb.set_trace()  # Debugging breakpoint
             if gt_valid_mask0.sum() == 0:
                 print(f"Skipping image pair {idx} due to no valid points in gt_valid_mask0")
                 continue
-            # epe3d = np.linalg.norm(norm_gt_allo_scene_flow[gt_valid_mask0] - norm_pred_allo_scene_flow[gt_valid_mask0], axis=-1)
-            epe3d = np.linalg.norm((norm_gt_points[0] + norm_gt_allo_scene_flow)[gt_valid_mask0] - (norm_pred_points[0] + norm_pred_allo_scene_flow)[gt_valid_mask0], axis=-1)
+
+            epe3d = np.linalg.norm((gt_pts3d0 + gt_allo_scene_flow)[gt_valid_mask0] - (pred_tracks_3d_pts3d[0] + pred_allo_scene_flow)[gt_valid_mask0], axis=-1)
+            epe3d_sf = np.linalg.norm(gt_allo_scene_flow[gt_valid_mask0] - pred_allo_scene_flow[gt_valid_mask0], axis=-1)
+            abs_rel = epe3d / (np.linalg.norm(gt_pts3d0[gt_valid_mask0] + gt_allo_scene_flow[gt_valid_mask0], axis=-1) + 1e-8)
 
             cur_seq_metrics['epe3d_allo_image_all'] += np.mean(epe3d)
             cur_seq_metrics['epe3d_allo_pixel_all'] += np.sum(epe3d)
@@ -648,16 +806,17 @@ def main():
 
             # Calculate delta metrics
             for threshold in delta_thresholds:
-                norm_threshold = threshold / gt_norm_factor
-                cur_seq_metrics[f'delta_{threshold}'] += np.sum(epe3d < norm_threshold)
+                cur_seq_metrics[f'delta_{threshold}'] += np.sum(abs_rel < threshold)
+
+            for threshold in delta_epe_thresholds:
+                cur_seq_metrics[f'delta_epe_{threshold}'] += np.sum(epe3d_sf < threshold)
 
             # Calculate outlier metrics
             for threshold in outlier_thresholds:
-                norm_threshold = threshold / gt_norm_factor
-                cur_seq_metrics[f'outlier_{threshold}'] += np.sum(epe3d > norm_threshold)
+                cur_seq_metrics[f'outlier_{threshold}'] += np.sum(abs_rel > threshold)
 
-            # Print ongoing avg epe3d_allo_image_all
-            # print(cur_seq_metrics['epe3d_allo_image_all'] / (idx + 1))
+            for threshold in outlier_epe_thresholds:
+                cur_seq_metrics[f'outlier_epe_{threshold}'] += np.sum(epe3d_sf > threshold)
 
             # Visualization
             if args.viz:
@@ -673,9 +832,9 @@ def main():
                     image1=viz_img1,
                     poses=[gt_cam0, gt_cam1],
                     intrinsics=view0["camera_intrinsics"],
-                    pts3d0=norm_gt_points[0],
-                    pts3d1=norm_gt_points[1],
-                    allo_scene_flow=norm_gt_allo_scene_flow,
+                    pts3d0=gt_pts3d0,
+                    pts3d1=gt_pts3d1,
+                    allo_scene_flow=gt_allo_scene_flow,
                     mask0=gt_valid_mask0,
                     mask1=gt_valid_mask1,
                 )
@@ -699,9 +858,9 @@ def main():
                     image1=viz_img1,
                     poses=[poses_c2w[0], poses_c2w[1]],
                     intrinsics=pred_intrinsics[0],
-                    pts3d0=norm_pred_points[0],
-                    pts3d1=norm_pred_points[1],
-                    allo_scene_flow=norm_pred_allo_scene_flow,
+                    pts3d0=pred_pts3d[0],
+                    pts3d1=pred_pts3d[1],
+                    allo_scene_flow=pred_allo_scene_flow,
                     mask0=None,
                     mask1=None,  # Using the same mask for both images
                 )
@@ -712,10 +871,17 @@ def main():
         # Aggregate and Print sequence metrics
         cur_seq_metrics['epe3d_allo_image_all'] /= len(dataset)
         cur_seq_metrics['epe3d_allo_pixel_all'] /= cur_seq_metrics['num_valid_pixels']
+        cur_seq_metrics['epe3d_sf_allo_image_all'] /= len(dataset)
+        cur_seq_metrics['epe3d_sf_allo_pixel_all'] /= cur_seq_metrics['num_valid_pixels']
         for threshold in delta_thresholds:
             cur_seq_metrics[f'delta_{threshold}'] /= cur_seq_metrics['num_valid_pixels']
         for threshold in outlier_thresholds:
             cur_seq_metrics[f'outlier_{threshold}'] /= cur_seq_metrics['num_valid_pixels']
+
+        for threshold in delta_epe_thresholds:
+            cur_seq_metrics[f'delta_epe_{threshold}'] /= cur_seq_metrics['num_valid_pixels']
+        for threshold in outlier_epe_thresholds:
+            cur_seq_metrics[f'outlier_epe_{threshold}'] /= cur_seq_metrics['num_valid_pixels']
 
         print(f"sequence:{sequence_path}")
         print(f"metrics: {cur_seq_metrics}")
@@ -723,40 +889,66 @@ def main():
         # Add sequence metrics into all_seq_metrics
         all_seq_metrics['epe3d_allo_image_all'] += cur_seq_metrics['epe3d_allo_image_all']
         all_seq_metrics['epe3d_allo_pixel_all'] += cur_seq_metrics['epe3d_allo_pixel_all']
+        all_seq_metrics['epe3d_sf_allo_image_all'] += cur_seq_metrics['epe3d_sf_allo_image_all']
+        all_seq_metrics['epe3d_sf_allo_pixel_all'] += cur_seq_metrics['epe3d_sf_allo_pixel_all']
         all_seq_metrics['num_valid_pixels'] += cur_seq_metrics['num_valid_pixels']
         for threshold in delta_thresholds:
             all_seq_metrics[f'delta_{threshold}'] += cur_seq_metrics[f'delta_{threshold}']
         for threshold in outlier_thresholds:
             all_seq_metrics[f'outlier_{threshold}'] += cur_seq_metrics[f'outlier_{threshold}']
 
+        for threshold in delta_epe_thresholds:
+            all_seq_metrics[f'delta_epe_{threshold}'] += cur_seq_metrics[f'delta_epe_{threshold}']
+        for threshold in outlier_epe_thresholds:
+            all_seq_metrics[f'outlier_epe_{threshold}'] += cur_seq_metrics[f'outlier_epe_{threshold}']
+
     # Finalize all_seq_metrics
     all_seq_metrics['epe3d_allo_image_all'] /= len(data_sequences)
     all_seq_metrics['epe3d_allo_pixel_all'] /= len(data_sequences)
+    all_seq_metrics['epe3d_sf_allo_image_all'] /= len(data_sequences)
+    all_seq_metrics['epe3d_sf_allo_pixel_all'] /= len(data_sequences)
     for threshold in delta_thresholds:
         all_seq_metrics[f'delta_{threshold}'] /= len(data_sequences)
     for threshold in outlier_thresholds:
         all_seq_metrics[f'outlier_{threshold}'] /= len(data_sequences)
 
+    for threshold in delta_epe_thresholds:
+        all_seq_metrics[f'delta_epe_{threshold}'] /= len(data_sequences)
+    for threshold in outlier_epe_thresholds:
+        all_seq_metrics[f'outlier_epe_{threshold}'] /= len(data_sequences)
+
     print("Final Metrics across all sequences:")
     print(f"epe3d_allo_image_all: {all_seq_metrics['epe3d_allo_image_all']}")
     print(f"epe3d_allo_pixel_all: {all_seq_metrics['epe3d_allo_pixel_all']}")
+    print(f"epe3d_sf_allo_image_all: {all_seq_metrics['epe3d_sf_allo_image_all']}")
+    print(f"epe3d_sf_allo_pixel_all: {all_seq_metrics['epe3d_sf_allo_pixel_all']}")
     print(f"num_valid_pixels: {all_seq_metrics['num_valid_pixels']}")
     for threshold in delta_thresholds:
         print(f"delta_{threshold}: {all_seq_metrics[f'delta_{threshold}']}")
     for threshold in outlier_thresholds:    
         print(f"outlier_{threshold}: {all_seq_metrics[f'outlier_{threshold}']}")
+    for threshold in delta_epe_thresholds:
+        print(f"delta_epe_{threshold}: {all_seq_metrics[f'delta_epe_{threshold}']}")
+    for threshold in outlier_epe_thresholds:
+        print(f"outlier_epe_{threshold}: {all_seq_metrics[f'outlier_epe_{threshold}']}")
 
     # Save metrics to txt
-    metrics_file = os.path.join(f"{args.dataset}_vggt_cotracker_benchmarking_metrics.txt")
+    metrics_file = os.path.join(f"{args.dataset}_mast3r_cotracker_benchmarking_metrics.txt")
     with open(metrics_file, "w") as f:
         f.write("Final Metrics across all sequences:\n")
         f.write(f"epe3d_allo_image_all: {all_seq_metrics['epe3d_allo_image_all']}\n")
         f.write(f"epe3d_allo_pixel_all: {all_seq_metrics['epe3d_allo_pixel_all']}\n")
+        f.write(f"epe3d_sf_allo_image_all: {all_seq_metrics['epe3d_sf_allo_image_all']}\n")
+        f.write(f"epe3d_sf_allo_pixel_all: {all_seq_metrics['epe3d_sf_allo_pixel_all']}\n")
         f.write(f"num_valid_pixels: {all_seq_metrics['num_valid_pixels']}\n")
         for threshold in delta_thresholds:
             f.write(f"delta_{threshold}: {all_seq_metrics[f'delta_{threshold}']}\n")
         for threshold in outlier_thresholds:
             f.write(f"outlier_{threshold}: {all_seq_metrics[f'outlier_{threshold}']}\n")
+        for threshold in delta_epe_thresholds:
+            f.write(f"delta_epe_{threshold}: {all_seq_metrics[f'delta_epe_{threshold}']}\n")
+        for threshold in outlier_epe_thresholds:
+            f.write(f"outlier_epe_{threshold}: {all_seq_metrics[f'outlier_epe_{threshold}']}\n")
 
     print(f"Metrics saved to {metrics_file}")
 

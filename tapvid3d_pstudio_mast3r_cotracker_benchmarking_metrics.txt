@@ -1,0 +1,16 @@
+Final Metrics across all sequences:
+epe3d_allo_image_all: 0.4744619138240814
+epe3d_allo_pixel_all: 0.48413526950895075
+epe3d_sf_allo_image_all: 0.0
+epe3d_sf_allo_pixel_all: 0.0
+num_valid_pixels: 39150.0
+delta_0.05: 0.245112568687793
+delta_0.1: 0.5283226100857854
+delta_0.2: 0.6968702181214369
+delta_0.4: 0.8199320450158443
+outlier_0.15: 0.35449280048654414
+delta_epe_0.1: 0.17465450010654632
+delta_epe_0.3: 0.48480103613789816
+delta_epe_0.5: 0.688457697549204
+delta_epe_1.0: 0.8945490277961776
+outlier_epe_0.25: 0.5761066458700272
